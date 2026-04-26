@@ -5,6 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
+from rest_framework.pagination import PageNumberPagination
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.core.mail import send_mail, BadHeaderError
 from django.conf import settings
@@ -18,14 +19,30 @@ from .models import NormalUser, MedicalPersonnel
 from .serializers import (
     NormalUserRegisterSerializer,
     AccountActivationSerializer,
+    UnifiedActivationSerializer,
     NormalUserSerializer,
     MedicalPersonnelSerializer,
-    AdminCreateMedicalPersonnelSerializer,
     MedicalPersonnelActivationSerializer,
+    MedicalPersonnelRegisterUserSerializer,
     LoginSerializer,
     PasswordChangeSerializer,
     ProfileUpdateSerializer,
 )
+
+
+# ---------------------------------------------------------------------------
+# Pagination
+# ---------------------------------------------------------------------------
+
+class StandardPagination(PageNumberPagination):
+    """
+    Standard pagination with 20 results per page.
+    Can be overridden via ?page_size=50 query parameter.
+    """
+    page_size = 20
+    page_size_query_param = 'page_size'
+    page_size_query_description = 'Number of results per page'
+    max_page_size = 100
 
 
 # ---------------------------------------------------------------------------
@@ -96,9 +113,9 @@ def _send_login_id_email(user) -> None:
 
 class NormalUserViewSet(GenericViewSet):
     """
-    Step 1  POST /user/register/   — submit basic info, receive login_id by email
-    Step 2  POST /user/activate/   — submit login_id + password → account live
-            POST /user/login/      — login with login_id + password
+    Step 1  POST /user/register/    — submit basic info, receive login_id by email (normal users only)
+    Step 2  POST /activate/         — submit login_id + password → account live (both user types)
+            POST /user/login/       — login with login_id + password (both user types)
             GET  /user/profile/
             PATCH /user/update-profile/
             POST /user/change-password/
@@ -111,7 +128,7 @@ class NormalUserViewSet(GenericViewSet):
     # Maps each action to its serializer class.
     _serializer_map = {
         'register':        NormalUserRegisterSerializer,
-        'activate':        AccountActivationSerializer,
+        'activate':        UnifiedActivationSerializer,
         'login':           LoginSerializer,
         'profile':         NormalUserSerializer,
         'update_profile':  ProfileUpdateSerializer,
@@ -191,9 +208,10 @@ class NormalUserViewSet(GenericViewSet):
         operation_summary="Step 2 — Activate account",
         operation_description=(
             "Submit the Login ID received by email plus a new password. "
-            "Sets the password, marks the account verified, and returns JWT tokens."
+            "Sets the password, marks the account verified, and returns JWT tokens. "
+            "Works for both Normal Users and Medical Personnel."
         ),
-        request_body=AccountActivationSerializer,
+        request_body=UnifiedActivationSerializer,
         responses={
             200: openapi.Response("Account activated — JWT tokens returned", NormalUserSerializer),
             400: "Validation error (bad login_id, password mismatch, weak password)",
@@ -206,15 +224,16 @@ class NormalUserViewSet(GenericViewSet):
         Submit: login_id, password, confirm_password
         Validates login_id + password strength, sets password, marks account verified.
         Returns JWT tokens so the frontend can redirect straight into the app.
+        Works for both NormalUser and MedicalPersonnel.
         """
-        serializer = AccountActivationSerializer(data=request.data)
+        serializer = UnifiedActivationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.activate()
 
         return Response(
             {
                 'message': 'Account activated successfully. Welcome to Navjeevan!',
-                'user':    NormalUserSerializer(user).data,
+                'user':    _profile_serializer(user).data,
                 'tokens':  _jwt_tokens(user),
             },
             status=status.HTTP_200_OK,
@@ -353,75 +372,40 @@ class MedicalPersonnelViewSet(GenericViewSet):
         return None
 
     def get_permissions(self):
-        if self.action == 'activate_personnel':
-            return [AllowAny()]
         return [IsAuthenticated()]
-
-    # ── Create ───────────────────────────────────────────────────────────────
-    @swagger_auto_schema(
-        operation_summary="Create medical personnel",
-        operation_description="Superadmin only. Creates a medical personnel account with auto-generated credentials.",
-        request_body=AdminCreateMedicalPersonnelSerializer,
-        responses={
-            201: openapi.Response("Medical personnel created", MedicalPersonnelSerializer),
-            400: "Validation error",
-            403: "Not a superuser",
-        },
-        tags=["Medical Personnel"],
-    )
-    @action(detail=False, methods=['post'])
-    def create_personnel(self, request):
-        if err := self._check_superuser(request):
-            return err
-
-        serializer = AdminCreateMedicalPersonnelSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        user = serializer.save()
-
-        try:
-            _send_login_id_email(user)
-        except Exception:
-            # Account was created — delete it so the superadmin can retry cleanly.
-            user.delete()
-            return Response(
-                {
-                    'error': (
-                        'Medical personnel profile creation failed: '
-                        'we could not send the Login ID email. Please check the email address and try again.'
-                    )
-                },
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-
-        return Response(
-            {
-                'message': (
-                    'Medical personnel profile created and activated for setup. '
-                    f'Login ID has been sent to {user.email}. '
-                    'Account is inactive until the personnel activates it with their password.'
-                ),
-                'user': MedicalPersonnelSerializer(user).data,
-                'login_id': user.login_id if settings.DEBUG else None,
-            },
-            status=status.HTTP_201_CREATED,
-        )
 
     # ── List ─────────────────────────────────────────────────────────────────
     @swagger_auto_schema(
         operation_summary="List medical personnel",
-        operation_description="Superadmin only. Returns all medical personnel records.",
+        operation_description="Superadmin only. Returns all medical personnel records with pagination.",
+        manual_parameters=[
+            openapi.Parameter(
+                'page', openapi.IN_QUERY,
+                description="Page number (default: 1)",
+                type=openapi.TYPE_INTEGER, required=False,
+            ),
+            openapi.Parameter(
+                'page_size', openapi.IN_QUERY,
+                description="Number of results per page (default: 20, max: 100)",
+                type=openapi.TYPE_INTEGER, required=False,
+            ),
+        ],
         responses={
-            200: MedicalPersonnelSerializer(many=True),
+            200: openapi.Response("Paginated list of medical personnel records"),
             403: "Not a superuser",
         },
-        tags=["Medical Personnel"],
+        tags=["Medical Personnel - Super Admin"],
     )
     @action(detail=False, methods=['get'])
     def list_personnel(self, request):
         if err := self._check_superuser(request):
             return err
-        serializer = MedicalPersonnelSerializer(self.get_queryset(), many=True)
-        return Response(serializer.data)
+        
+        queryset = self.get_queryset()
+        paginator = StandardPagination()
+        paginated_queryset = paginator.paginate_queryset(queryset, request)
+        serializer = MedicalPersonnelSerializer(paginated_queryset, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
     # ── Retrieve ─────────────────────────────────────────────────────────────
     @swagger_auto_schema(
@@ -440,7 +424,7 @@ class MedicalPersonnelViewSet(GenericViewSet):
             403: "Not a superuser",
             404: "Not found",
         },
-        tags=["Medical Personnel"],
+        tags=["Medical Personnel - Super Admin"],
     )
     @action(detail=False, methods=['get'])
     def retrieve_personnel(self, request):
@@ -455,40 +439,6 @@ class MedicalPersonnelViewSet(GenericViewSet):
             )
         personnel = get_object_or_404(MedicalPersonnel, uuid=personnel_uuid)
         return Response(MedicalPersonnelSerializer(personnel).data)
-
-    # ── Activate ─────────────────────────────────────────────────────────────
-    @swagger_auto_schema(
-        operation_summary="Activate medical personnel account",
-        operation_description=(
-            "Public endpoint. Medical personnel submits login_id, password, confirm_password. "
-            "Sets password, marks verified and active, returns JWT tokens."
-        ),
-        request_body=MedicalPersonnelActivationSerializer,
-        responses={
-            200: openapi.Response("Account activated — JWT tokens returned", MedicalPersonnelSerializer),
-            400: "Validation error (bad login_id, password mismatch, weak password)",
-        },
-        tags=["Medical Personnel"],
-    )
-    @action(detail=False, methods=['post'])
-    def activate_personnel(self, request):
-        """
-        Submit: login_id, password, confirm_password
-        Validates login_id + password strength, sets password, marks account verified and active.
-        Returns JWT tokens so the frontend can redirect straight into the app.
-        """
-        serializer = MedicalPersonnelActivationSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        user = serializer.activate()
-
-        return Response(
-            {
-                'message': 'Medical personnel account activated successfully.',
-                'user': MedicalPersonnelSerializer(user).data,
-                'tokens': _jwt_tokens(user),
-            },
-            status=status.HTTP_200_OK,
-        )
 
     # ── Update ───────────────────────────────────────────────────────────────
     @swagger_auto_schema(
@@ -515,7 +465,7 @@ class MedicalPersonnelViewSet(GenericViewSet):
             403: "Not a superuser",
             404: "Not found",
         },
-        tags=["Medical Personnel"],
+        tags=["Medical Personnel - Super Admin"],
     )
     @action(detail=False, methods=['patch'])
     def update_personnel(self, request):
@@ -540,3 +490,214 @@ class MedicalPersonnelViewSet(GenericViewSet):
                 'user':    MedicalPersonnelSerializer(personnel).data,
             }
         )
+
+    # ── Profile (Own) ───────────────────────────────────────────────────────
+    @swagger_auto_schema(
+        operation_summary="Get medical personnel profile",
+        operation_description="Get the authenticated medical personnel's own profile.",
+        responses={200: MedicalPersonnelSerializer},
+        tags=["Medical Personnel — Profile"],
+    )
+    @action(detail=False, methods=['get'])
+    def profile(self, request):
+        """Get the authenticated medical personnel's own profile."""
+        if not isinstance(request.user, MedicalPersonnel):
+            return Response(
+                {'error': 'Only medical personnel can access this endpoint.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return Response(MedicalPersonnelSerializer(request.user).data)
+
+    # ── Update Profile (Own) ─────────────────────────────────────────────────
+    @swagger_auto_schema(
+        operation_summary="Update medical personnel profile",
+        operation_description="Update the authenticated medical personnel's own profile.",
+        request_body=ProfileUpdateSerializer,
+        responses={200: MedicalPersonnelSerializer},
+        tags=["Medical Personnel — Profile"],
+    )
+    @action(detail=False, methods=['patch'])
+    def update_profile(self, request):
+        """Update the authenticated medical personnel's own profile."""
+        if not isinstance(request.user, MedicalPersonnel):
+            return Response(
+                {'error': 'Only medical personnel can access this endpoint.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = ProfileUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user = request.user
+        for field, value in serializer.validated_data.items():
+            setattr(user, field, value)
+
+        user.save()
+        return Response(
+            {
+                'message': 'Profile updated successfully.',
+                'user':    MedicalPersonnelSerializer(user).data,
+            }
+        )
+
+    # ── List Normal Users (Filterable) ───────────────────────────────────────
+    @swagger_auto_schema(
+        operation_summary="List normal users",
+        operation_description="Medical personnel can list normal users with filters (name, email, status, region) and pagination.",
+        manual_parameters=[
+            openapi.Parameter(
+                'page', openapi.IN_QUERY,
+                description="Page number (default: 1)",
+                type=openapi.TYPE_INTEGER, required=False,
+            ),
+            openapi.Parameter(
+                'page_size', openapi.IN_QUERY,
+                description="Number of results per page (default: 20, max: 100)",
+                type=openapi.TYPE_INTEGER, required=False,
+            ),
+            openapi.Parameter(
+                'name', openapi.IN_QUERY,
+                description="Filter by user name (partial match)",
+                type=openapi.TYPE_STRING, required=False,
+            ),
+            openapi.Parameter(
+                'email', openapi.IN_QUERY,
+                description="Filter by email (exact match)",
+                type=openapi.TYPE_STRING, required=False,
+            ),
+            openapi.Parameter(
+                'status', openapi.IN_QUERY,
+                description="Filter by status (active/inactive)",
+                type=openapi.TYPE_STRING, required=False,
+            ),
+            openapi.Parameter(
+                'region', openapi.IN_QUERY,
+                description="Filter by region",
+                type=openapi.TYPE_STRING, required=False,
+            ),
+        ],
+        responses={
+            200: openapi.Response("Paginated list of normal users"),
+            403: "Only medical personnel can access this endpoint",
+        },
+        tags=["Medical Personnel — User Management"],
+    )
+    @action(detail=False, methods=['get'])
+    def list_users(self, request):
+        """List normal users with optional filters and pagination."""
+        if not isinstance(request.user, MedicalPersonnel):
+            return Response(
+                {'error': 'Only medical personnel can access this endpoint.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        queryset = NormalUser.objects.all()
+
+        # Apply filters
+        name = request.query_params.get('name')
+        if name:
+            queryset = queryset.filter(name__icontains=name)
+
+        email = request.query_params.get('email')
+        if email:
+            queryset = queryset.filter(email=email)
+
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        region = request.query_params.get('region')
+        if region:
+            queryset = queryset.filter(region__icontains=region)
+
+        # Apply pagination
+        paginator = StandardPagination()
+        paginated_queryset = paginator.paginate_queryset(queryset, request)
+        serializer = NormalUserSerializer(paginated_queryset, many=True)
+        return paginator.get_paginated_response(serializer.data)
+
+    # ── Register Normal User ─────────────────────────────────────────────────
+    @swagger_auto_schema(
+        operation_summary="Register a normal user",
+        operation_description="Medical personnel can register a normal user. Account is created as inactive and unverified.",
+        request_body=MedicalPersonnelRegisterUserSerializer,
+        responses={
+            201: openapi.Response("User registered successfully", NormalUserSerializer),
+            400: "Validation error",
+            403: "Only medical personnel can access this endpoint",
+            502: "Email delivery failed",
+        },
+        tags=["Medical Personnel — User Management"],
+    )
+    @action(detail=False, methods=['post'])
+    def register_user(self, request):
+        """Medical personnel can register a normal user."""
+        if not isinstance(request.user, MedicalPersonnel):
+            return Response(
+                {'error': 'Only medical personnel can access this endpoint.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = MedicalPersonnelRegisterUserSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+
+        try:
+            _send_login_id_email(user)
+        except Exception:
+            user.delete()
+            return Response(
+                {
+                    'error': (
+                        'User registration failed: we could not send the Login ID email. '
+                        'Please check the email address and try again.'
+                    )
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(
+            {
+                'message': (
+                    'User registered successfully. Login ID has been sent to '
+                    f'{user.email}. User can now activate their account.'
+                ),
+                'login_id': user.login_id if settings.DEBUG else None,
+                'user': NormalUserSerializer(user).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+        # ── Change Password ──────────────────────────────────────────────────────
+    @swagger_auto_schema(
+        operation_summary="Change password",
+        operation_description="Provide old password and a new password that meets strength requirements.",
+        request_body=PasswordChangeSerializer,
+        responses={
+            200: openapi.Response("Password changed successfully"),
+            400: "Validation error",
+        },
+        tags=["Medical Personnel — Profile"],
+    )
+    @action(detail=False, methods=['post'])
+    def change_password(self, request):
+        serializer = PasswordChangeSerializer(
+            data=request.data, context={'request': request}
+        )
+        serializer.is_valid(raise_exception=True)
+        request.user.set_password(serializer.validated_data['new_password'])
+        request.user.save()
+        return Response({'message': 'Password changed successfully.'})
+
+    # ── Deactivate ───────────────────────────────────────────────────────────
+    @swagger_auto_schema(
+        operation_summary="Deactivate account",
+        operation_description="Soft-deletes the account by marking it inactive. Cannot be undone via the API.",
+        responses={200: openapi.Response("Account deactivated successfully")},
+        tags=["Medical Personnel — Profile"],
+    )
+    @action(detail=False, methods=['post'])
+    def deactivate_account(self, request):
+        request.user.status = 'inactive'
+        request.user.save()
+        return Response({'message': 'Account deactivated successfully.'})

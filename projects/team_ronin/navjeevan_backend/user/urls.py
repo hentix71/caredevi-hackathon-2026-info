@@ -8,10 +8,10 @@ urlpatterns = [
          NormalUserViewSet.as_view({'post': 'register'}),
          name='user-register'),
 
-    # ── Step 2: Submit login_id + password → account activated ──────────────
-    path('user/activate/',
+    # ── Step 2: Activation (unified for both user types) ─────────────────────────────────────────────────────────────────────────────
+    path('activate/',
          NormalUserViewSet.as_view({'post': 'activate'}),
-         name='user-activate'),
+         name='activate'),
 
     # ── Login (works for both user types) ───────────────────────────────────
     path('user/login/',
@@ -35,15 +35,7 @@ urlpatterns = [
          NormalUserViewSet.as_view({'post': 'deactivate_account'}),
          name='user-deactivate'),
 
-    # ── Medical Personnel (superadmin only, except activation) ─────────────────
-    path('medical/create/',
-         MedicalPersonnelViewSet.as_view({'post': 'create_personnel'}),
-         name='medical-create'),
-
-    path('medical/activate/',
-         MedicalPersonnelViewSet.as_view({'post': 'activate_personnel'}),
-         name='medical-activate'),
-
+    # ── Medical Personnel (superadmin only for management) ──────────────────────────────────────────────────
     path('medical/list/',
          MedicalPersonnelViewSet.as_view({'get': 'list_personnel'}),
          name='medical-list'),
@@ -55,4 +47,30 @@ urlpatterns = [
     path('medical/update/',
          MedicalPersonnelViewSet.as_view({'patch': 'update_personnel'}),
          name='medical-update'),
+
+    # ── Medical Personnel (authenticated, not just superadmin) ───────────────────────────────────────────────────
+    path('medical/profile/',
+         MedicalPersonnelViewSet.as_view({'get': 'profile'}),
+         name='medical-profile'),
+
+    path('medical/update-profile/',
+         MedicalPersonnelViewSet.as_view({'patch': 'update_profile'}),
+         name='medical-update-profile'),
+
+     path('medical/change-password/',
+         MedicalPersonnelViewSet.as_view({'post': 'change_password'}),
+         name='medical-change-password'),
+
+    path('medical/deactivate/',
+         MedicalPersonnelViewSet.as_view({'post': 'deactivate_account'}),
+         name='medical-deactivate'),
+
+    # ── Medical Personnel — User Management ─────────────────────────────────────────────────────
+    path('medical/users/',
+         MedicalPersonnelViewSet.as_view({'get': 'list_users'}),
+         name='medical-list-users'),
+
+    path('medical/register-user/',
+         MedicalPersonnelViewSet.as_view({'post': 'register_user'}),
+         name='medical-register-user'),
 ]
