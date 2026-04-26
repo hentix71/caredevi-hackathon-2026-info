@@ -48,7 +48,8 @@ class Event (models.Model):
     event_status = models.CharField(
         choices=EventStatus.choices,
         default=EventStatus.NOT_STARTED,
-        verbose_name=_('Event Status')
+        verbose_name=_('Event Status'),
+        max_length=20
     )
 
     description = models.TextField(
